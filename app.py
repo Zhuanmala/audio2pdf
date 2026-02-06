@@ -18,7 +18,7 @@ from reportlab.pdfgen import canvas
 
 load_dotenv()
 
-MAX_FILE_SIZE_MB = 25
+MAX_FILE_SIZE_MB = 100
 TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe"
 TRANSLATE_MODEL = "gpt-4o-mini"
 TARGET_LANGUAGE = "Chinese (Simplified)"

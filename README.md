@@ -79,6 +79,6 @@ APP_PASSWORD = "your_login_password"
 
 ## Notes
 
-- OpenAI speech-to-text API currently has a file-size limit of 25 MB per request.
+- App upload size limit is set to 100 MB.
 - Current target language is configured in `app.py` with `TARGET_LANGUAGE`.
 - Do not commit `.env` or real secrets to GitHub.
