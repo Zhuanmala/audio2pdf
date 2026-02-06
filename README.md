@@ -34,6 +34,7 @@ Then edit `.env`:
 
 ```env
 GOOGLE_API_KEY=your_google_api_key_here
+GOOGLE_MODEL=gemini-2.5-flash
 APP_USERNAME=your_login_username
 APP_PASSWORD=your_login_password
 ```
@@ -65,6 +66,7 @@ This app is ready for **Streamlit Community Cloud** public deployment.
 
 ```toml
 GOOGLE_API_KEY = "your_google_api_key"
+GOOGLE_MODEL = "gemini-2.5-flash"
 APP_USERNAME = "your_login_username"
 APP_PASSWORD = "your_login_password"
 ```
@@ -83,3 +85,4 @@ APP_PASSWORD = "your_login_password"
 - Current target language is configured in `app.py` with `TARGET_LANGUAGE`.
 - Do not commit `.env` or real secrets to GitHub.
 - If you see quota errors, check your Google AI API key quota/billing in Google Cloud.
+- If you see model not found errors, set `GOOGLE_MODEL` in Secrets to a model available in your project/region.

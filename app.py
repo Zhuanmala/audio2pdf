@@ -6,6 +6,7 @@ import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -19,8 +20,12 @@ from reportlab.pdfgen import canvas
 load_dotenv()
 
 MAX_FILE_SIZE_MB = 100
-GOOGLE_MODEL = "gemini-1.5-flash"
 TARGET_LANGUAGE = "Chinese (Simplified)"
+DEFAULT_GOOGLE_MODELS = (
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-001",
+)
 SUPPORTED_AUDIO_TYPES = ["mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm", "ogg"]
 MIME_BY_SUFFIX = {
     ".mp3": "audio/mpeg",
@@ -53,6 +58,13 @@ def resolve_google_api_key() -> str:
     return resolve_config_value("GOOGLE_API_KEY")
 
 
+def resolve_google_model() -> str:
+    configured = resolve_config_value("GOOGLE_MODEL")
+    if configured:
+        return configured
+    return DEFAULT_GOOGLE_MODELS[0]
+
+
 def resolve_login_credentials() -> tuple[str, str]:
     username = resolve_config_value("APP_USERNAME")
     password = resolve_config_value("APP_PASSWORD")
@@ -68,29 +80,82 @@ def get_google_client() -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
-def extract_gemini_text(response: object) -> str:
+def infer_mime_type(filename: str) -> str:
+    suffix = Path(filename).suffix.lower()
+    return MIME_BY_SUFFIX.get(suffix, "audio/mpeg")
+
+
+def extract_gemini_text(response: Any) -> str:
     text = getattr(response, "text", None)
     if isinstance(text, str) and text.strip():
         return text.strip()
 
     chunks: list[str] = []
-    for candidate in getattr(response, "candidates", []):
+    for candidate in getattr(response, "candidates", []) or []:
         content = getattr(candidate, "content", None)
         if not content:
             continue
-        for part in getattr(content, "parts", []):
+        for part in getattr(content, "parts", []) or []:
             part_text = getattr(part, "text", None)
             if isinstance(part_text, str) and part_text.strip():
                 chunks.append(part_text.strip())
     return "\n".join(chunks).strip()
 
 
-def infer_mime_type(filename: str) -> str:
-    suffix = Path(filename).suffix.lower()
-    return MIME_BY_SUFFIX.get(suffix, "audio/mpeg")
+def is_model_not_found_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "not_found" in message or "is not found for api version" in message
 
 
-def get_file_state_name(file_obj: object) -> str:
+def build_model_candidates() -> list[str]:
+    candidates: list[str] = []
+
+    working = st.session_state.get("google_working_model", "")
+    configured = resolve_google_model()
+
+    if isinstance(working, str) and working.strip():
+        candidates.append(working.strip())
+    if configured:
+        candidates.append(configured)
+
+    candidates.extend(DEFAULT_GOOGLE_MODELS)
+
+    deduped: list[str] = []
+    for model_name in candidates:
+        normalized = model_name.strip()
+        if normalized and normalized not in deduped:
+            deduped.append(normalized)
+    return deduped
+
+
+def generate_content_with_fallback(client: genai.Client, contents: list[Any]) -> Any:
+    attempted: list[str] = []
+    last_error: Exception | None = None
+
+    for model_name in build_model_candidates():
+        attempted.append(model_name)
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=contents,
+            )
+            st.session_state.google_working_model = model_name
+            return response
+        except Exception as exc:
+            last_error = exc
+            if not is_model_not_found_error(exc):
+                raise
+            continue
+
+    raise RuntimeError(
+        "No available Google model found. "
+        f"Attempted: {', '.join(attempted)}. "
+        "Set GOOGLE_MODEL in Secrets to a valid model for your region/project. "
+        f"Last error: {last_error}"
+    )
+
+
+def get_file_state_name(file_obj: Any) -> str:
     state = getattr(file_obj, "state", None)
     if state is None:
         return "ACTIVE"
@@ -106,22 +171,22 @@ def get_file_state_name(file_obj: object) -> str:
 def wait_for_file_active(
     client: genai.Client, file_name: str, max_wait_seconds: int = 180
 ) -> None:
-    start = time.time()
+    start_time = time.time()
     while True:
         status_file = client.files.get(name=file_name)
         state_name = get_file_state_name(status_file)
+
         if state_name in {"ACTIVE", "STATE_UNSPECIFIED", ""}:
             return
         if state_name == "FAILED":
             raise RuntimeError("Google file processing failed.")
-        if time.time() - start > max_wait_seconds:
+        if time.time() - start_time > max_wait_seconds:
             raise RuntimeError("Google file processing timed out.")
         time.sleep(1.5)
 
 
 def transcribe_audio_with_google(audio_bytes: bytes, filename: str) -> str:
     client = get_google_client()
-    mime_type = infer_mime_type(filename)
     uploaded = None
     suffix = Path(filename).suffix or ".wav"
 
@@ -138,12 +203,9 @@ def transcribe_audio_with_google(audio_bytes: bytes, filename: str) -> str:
             "Keep original meaning and line breaks. "
             "Return transcript text only, no explanation."
         )
-        response = client.models.generate_content(
-            model=GOOGLE_MODEL,
-            contents=[
-                {"text": prompt},
-                uploaded,
-            ],
+        response = generate_content_with_fallback(
+            client=client,
+            contents=[prompt, uploaded],
         )
         transcript = extract_gemini_text(response)
         if not transcript:
@@ -168,9 +230,9 @@ def translate_text_with_google(text: str, target_language: str) -> str:
         "Return translated text only.\n\n"
         f"{text}"
     )
-    response = client.models.generate_content(
-        model=GOOGLE_MODEL,
-        contents=[{"text": prompt}],
+    response = generate_content_with_fallback(
+        client=client,
+        contents=[prompt],
     )
     translated = extract_gemini_text(response)
     if not translated:
@@ -307,6 +369,7 @@ def initialize_state() -> None:
         "last_error": "",
         "pdf_bytes": b"",
         "pdf_filename": "translation.pdf",
+        "google_working_model": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -345,7 +408,7 @@ def render_login_gate() -> bool:
     return False
 
 
-def process_uploaded_audio(uploaded_audio) -> None:
+def process_uploaded_audio(uploaded_audio: Any) -> None:
     audio_bytes = uploaded_audio.getvalue()
     if not audio_bytes:
         st.session_state.last_error = "Uploaded audio is empty."
@@ -395,9 +458,7 @@ def main() -> None:
 
     if not resolve_google_api_key():
         st.error("GOOGLE_API_KEY is missing.")
-        st.info(
-            "Please set GOOGLE_API_KEY in .env or Streamlit Cloud Secrets."
-        )
+        st.info("Please set GOOGLE_API_KEY in .env or Streamlit Cloud Secrets.")
         st.stop()
 
     uploaded_audio = st.file_uploader(
