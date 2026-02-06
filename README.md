@@ -10,9 +10,9 @@ This project is a minimal tool for:
 ## Stack
 
 - Streamlit (web UI)
-- OpenAI API
-  - `audio.transcriptions` for speech-to-text
-  - `responses` for translation
+- Google Gemini API
+  - Audio transcription
+  - Text translation
 - ReportLab for PDF generation
 
 ## Quick Start
@@ -33,7 +33,7 @@ cp .env.example .env
 Then edit `.env`:
 
 ```env
-OPENAI_API_KEY=your_openai_api_key_here
+GOOGLE_API_KEY=your_google_api_key_here
 APP_USERNAME=your_login_username
 APP_PASSWORD=your_login_password
 ```
@@ -64,7 +64,7 @@ This app is ready for **Streamlit Community Cloud** public deployment.
    - In **Secrets**, set:
 
 ```toml
-OPENAI_API_KEY = "your_new_openai_api_key"
+GOOGLE_API_KEY = "your_google_api_key"
 APP_USERNAME = "your_login_username"
 APP_PASSWORD = "your_login_password"
 ```
@@ -82,3 +82,4 @@ APP_PASSWORD = "your_login_password"
 - App upload size limit is set to 100 MB.
 - Current target language is configured in `app.py` with `TARGET_LANGUAGE`.
 - Do not commit `.env` or real secrets to GitHub.
+- If you see quota errors, check your Google AI API key quota/billing in Google Cloud.

@@ -3,13 +3,13 @@ import hmac
 import io
 import os
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import streamlit as st
 from dotenv import load_dotenv
-from openai import OpenAI
+from google import genai
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import simpleSplit
 from reportlab.pdfbase import pdfmetrics
@@ -19,10 +19,19 @@ from reportlab.pdfgen import canvas
 load_dotenv()
 
 MAX_FILE_SIZE_MB = 100
-TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe"
-TRANSLATE_MODEL = "gpt-4o-mini"
+GOOGLE_MODEL = "gemini-1.5-flash"
 TARGET_LANGUAGE = "Chinese (Simplified)"
-SUPPORTED_AUDIO_TYPES = ["mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm"]
+SUPPORTED_AUDIO_TYPES = ["mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm", "ogg"]
+MIME_BY_SUFFIX = {
+    ".mp3": "audio/mpeg",
+    ".mp4": "audio/mp4",
+    ".m4a": "audio/mp4",
+    ".mpeg": "audio/mpeg",
+    ".mpga": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".webm": "audio/webm",
+    ".ogg": "audio/ogg",
+}
 
 
 def resolve_config_value(key: str) -> str:
@@ -40,8 +49,8 @@ def resolve_config_value(key: str) -> str:
     return ""
 
 
-def resolve_api_key() -> str:
-    return resolve_config_value("OPENAI_API_KEY")
+def resolve_google_api_key() -> str:
+    return resolve_config_value("GOOGLE_API_KEY")
 
 
 def resolve_login_credentials() -> tuple[str, str]:
@@ -50,89 +59,123 @@ def resolve_login_credentials() -> tuple[str, str]:
     return username, password
 
 
-def get_openai_client() -> OpenAI:
-    api_key = resolve_api_key()
+def get_google_client() -> genai.Client:
+    api_key = resolve_google_api_key()
     if not api_key:
         raise RuntimeError(
-            "OPENAI_API_KEY is missing. Set it in .env or Streamlit Secrets."
+            "GOOGLE_API_KEY is missing. Set it in .env or Streamlit Secrets."
         )
-    return OpenAI(api_key=api_key)
+    return genai.Client(api_key=api_key)
 
 
-def normalize_language_hint(source_language: Optional[str]) -> Optional[str]:
-    if not source_language:
-        return None
-    normalized = source_language.strip().lower()
-    if normalized in {"auto", "automatic", "detect"}:
-        return None
-    return normalized
+def extract_gemini_text(response: object) -> str:
+    text = getattr(response, "text", None)
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+
+    chunks: list[str] = []
+    for candidate in getattr(response, "candidates", []):
+        content = getattr(candidate, "content", None)
+        if not content:
+            continue
+        for part in getattr(content, "parts", []):
+            part_text = getattr(part, "text", None)
+            if isinstance(part_text, str) and part_text.strip():
+                chunks.append(part_text.strip())
+    return "\n".join(chunks).strip()
 
 
-def transcribe_audio(
-    audio_bytes: bytes,
-    filename: Optional[str],
-    model: str,
-    source_language: Optional[str] = None,
-    prompt: str = "",
-) -> str:
-    suffix = Path(filename).suffix if filename else ".wav"
-    if not suffix:
-        suffix = ".wav"
+def infer_mime_type(filename: str) -> str:
+    suffix = Path(filename).suffix.lower()
+    return MIME_BY_SUFFIX.get(suffix, "audio/mpeg")
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
-        temp_file.write(audio_bytes)
-        temp_path = temp_file.name
+
+def get_file_state_name(file_obj: object) -> str:
+    state = getattr(file_obj, "state", None)
+    if state is None:
+        return "ACTIVE"
+    state_name = getattr(state, "name", None)
+    if isinstance(state_name, str) and state_name:
+        return state_name
+    state_str = str(state)
+    if "." in state_str:
+        return state_str.split(".")[-1]
+    return state_str
+
+
+def wait_for_file_active(
+    client: genai.Client, file_name: str, max_wait_seconds: int = 180
+) -> None:
+    start = time.time()
+    while True:
+        status_file = client.files.get(name=file_name)
+        state_name = get_file_state_name(status_file)
+        if state_name in {"ACTIVE", "STATE_UNSPECIFIED", ""}:
+            return
+        if state_name == "FAILED":
+            raise RuntimeError("Google file processing failed.")
+        if time.time() - start > max_wait_seconds:
+            raise RuntimeError("Google file processing timed out.")
+        time.sleep(1.5)
+
+
+def transcribe_audio_with_google(audio_bytes: bytes, filename: str) -> str:
+    client = get_google_client()
+    mime_type = infer_mime_type(filename)
+    uploaded = None
+    suffix = Path(filename).suffix or ".wav"
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_audio:
+        temp_audio.write(audio_bytes)
+        temp_path = temp_audio.name
 
     try:
-        with open(temp_path, "rb") as audio_file:
-            params = {"model": model, "file": audio_file}
-            language_hint = normalize_language_hint(source_language)
-            if language_hint:
-                params["language"] = language_hint
-            if prompt.strip():
-                params["prompt"] = prompt.strip()
+        uploaded = client.files.upload(file=temp_path)
+        wait_for_file_active(client=client, file_name=uploaded.name)
 
-            result = get_openai_client().audio.transcriptions.create(**params)
-            text = getattr(result, "text", None)
-            if text is None:
-                text = str(result)
-            return text.strip()
+        prompt = (
+            "Transcribe the audio into plain text. "
+            "Keep original meaning and line breaks. "
+            "Return transcript text only, no explanation."
+        )
+        response = client.models.generate_content(
+            model=GOOGLE_MODEL,
+            contents=[
+                {"text": prompt},
+                uploaded,
+            ],
+        )
+        transcript = extract_gemini_text(response)
+        if not transcript:
+            raise RuntimeError("No transcript text returned from Google.")
+        return transcript
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
+        if uploaded is not None:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass
 
 
-def extract_response_text(result: object) -> str:
-    output_text = getattr(result, "output_text", None)
-    if isinstance(output_text, str) and output_text.strip():
-        return output_text.strip()
-
-    chunks: list[str] = []
-    for item in getattr(result, "output", []):
-        for content in getattr(item, "content", []):
-            text = getattr(content, "text", None)
-            if isinstance(text, str) and text.strip():
-                chunks.append(text.strip())
-
-    if chunks:
-        return "\n".join(chunks)
-    return str(result).strip()
-
-
-def translate_text(text: str, target_language: str, model: str) -> str:
-    instructions = (
-        "You are a translation engine. "
-        "Translate user text into the requested target language. "
-        "Keep meaning and line breaks. Return only translated text."
+def translate_text_with_google(text: str, target_language: str) -> str:
+    client = get_google_client()
+    prompt = (
+        "Translate the following text to "
+        f"{target_language}. "
+        "Keep line breaks and original structure. "
+        "Return translated text only.\n\n"
+        f"{text}"
     )
-    user_input = f"Target language: {target_language}\n\nText:\n{text}"
-
-    result = get_openai_client().responses.create(
-        model=model,
-        instructions=instructions,
-        input=user_input,
+    response = client.models.generate_content(
+        model=GOOGLE_MODEL,
+        contents=[{"text": prompt}],
     )
-    return extract_response_text(result)
+    translated = extract_gemini_text(response)
+    if not translated:
+        raise RuntimeError("No translation text returned from Google.")
+    return translated
 
 
 def get_pdf_font_name() -> str:
@@ -238,14 +281,14 @@ def build_pdf_bytes(
     return buffer.getvalue()
 
 
-def validate_audio_size(size_bytes: int) -> Optional[str]:
+def validate_audio_size(size_bytes: int) -> str:
     size_mb = size_bytes / (1024 * 1024)
     if size_mb > MAX_FILE_SIZE_MB:
         return (
             f"Audio file is {size_mb:.1f} MB, which exceeds {MAX_FILE_SIZE_MB} MB. "
-            "Please upload a smaller file or split it."
+            "Please upload a smaller file."
         )
-    return None
+    return ""
 
 
 def build_download_pdf_name(original_filename: str) -> str:
@@ -262,8 +305,6 @@ def initialize_state() -> None:
         "auth_ok": False,
         "processed_hash": None,
         "last_error": "",
-        "transcript_text": "",
-        "translated_text": "",
         "pdf_bytes": b"",
         "pdf_filename": "translation.pdf",
     }
@@ -276,9 +317,7 @@ def render_login_gate() -> bool:
     expected_username, expected_password = resolve_login_credentials()
     if not expected_username or not expected_password:
         st.error("登录未配置：缺少 APP_USERNAME 或 APP_PASSWORD。")
-        st.info(
-            "请在 .env 或 Streamlit Secrets 中添加 APP_USERNAME 和 APP_PASSWORD。"
-        )
+        st.info("请在 .env 或 Streamlit Secrets 中添加 APP_USERNAME 和 APP_PASSWORD。")
         return False
 
     if st.session_state.auth_ok:
@@ -317,24 +356,18 @@ def process_uploaded_audio(uploaded_audio) -> None:
         return
 
     st.session_state.last_error = ""
-    st.session_state.transcript_text = ""
-    st.session_state.translated_text = ""
     st.session_state.pdf_bytes = b""
     st.session_state.pdf_filename = build_download_pdf_name(uploaded_audio.name)
 
     try:
-        with st.spinner("Transcribing and translating..."):
-            transcript = transcribe_audio(
+        with st.spinner("Transcribing and translating with Google..."):
+            transcript = transcribe_audio_with_google(
                 audio_bytes=audio_bytes,
                 filename=uploaded_audio.name,
-                model=TRANSCRIBE_MODEL,
-                source_language=None,
-                prompt="",
             )
-            translated = translate_text(
+            translated = translate_text_with_google(
                 text=transcript,
                 target_language=TARGET_LANGUAGE,
-                model=TRANSLATE_MODEL,
             )
             pdf_bytes = build_pdf_bytes(
                 original_text=transcript,
@@ -347,14 +380,12 @@ def process_uploaded_audio(uploaded_audio) -> None:
         return
 
     st.session_state.processed_hash = file_hash
-    st.session_state.transcript_text = transcript
-    st.session_state.translated_text = translated
     st.session_state.pdf_bytes = pdf_bytes
     st.session_state.last_error = ""
 
 
 def main() -> None:
-    st.set_page_config(page_title="Audio Translator PDF", layout="centered")
+    st.set_page_config(page_title="Audio Translation to PDF", layout="centered")
     st.title("Audio Translation to PDF")
     st.caption("Upload audio and get an auto-translated PDF file.")
 
@@ -362,12 +393,10 @@ def main() -> None:
     if not render_login_gate():
         return
 
-    api_key = resolve_api_key()
-    if not api_key:
-        st.error("OPENAI_API_KEY is missing.")
+    if not resolve_google_api_key():
+        st.error("GOOGLE_API_KEY is missing.")
         st.info(
-            "Local: create .env with OPENAI_API_KEY=... | "
-            "Streamlit Cloud: set OPENAI_API_KEY in app Secrets."
+            "Please set GOOGLE_API_KEY in .env or Streamlit Cloud Secrets."
         )
         st.stop()
 
